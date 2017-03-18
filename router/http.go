@@ -31,8 +31,8 @@ type HTTPListener struct {
 	Watcher
 	DataStoreReader
 
-	Addr    string
-	TLSAddr string
+	Addrs    []string
+	TLSAddrs []string
 
 	mtx      sync.RWMutex
 	domains  map[string]*node
@@ -44,8 +44,8 @@ type HTTPListener struct {
 	wm        *WatchManager
 	stopSync  func()
 
-	listener      net.Listener
-	tlsListener   net.Listener
+	listeners     []net.Listener
+	tlsListeners  []net.Listener
 	closed        bool
 	cookieKey     *[32]byte
 	keypair       tls.Certificate
@@ -70,11 +70,11 @@ func (s *HTTPListener) Close() error {
 	for _, service := range s.services {
 		service.sc.Close()
 	}
-	if s.listener != nil {
-		s.listener.Close()
+	for _, listener := range s.listeners {
+		listener.Close()
 	}
-	if s.tlsListener != nil {
-		s.tlsListener.Close()
+	for _, listener := range s.tlsListeners {
+		listener.Close()
 	}
 	s.closed = true
 	return nil
@@ -166,15 +166,22 @@ func (s *HTTPListener) doSync(ctx context.Context, errc chan<- error) <-chan str
 
 func (s *HTTPListener) startListen() error {
 	if err := s.listenAndServe(); err != nil {
+		s.Close()
 		return err
 	}
-	s.Addr = s.listener.Addr().String()
+	s.Addrs = []string{}
+	for _, listener := range s.listeners {
+		s.Addrs = append(s.Addrs, listener.Addr().String())
+	}
 
 	if err := s.listenAndServeTLS(); err != nil {
-		s.listener.Close()
+		s.Close()
 		return err
 	}
-	s.TLSAddr = s.tlsListener.Addr().String()
+	s.TLSAddrs = []string{}
+	for _, listener := range s.tlsListeners {
+		s.TLSAddrs = append(s.TLSAddrs, listener.Addr().String())
+	}
 
 	return nil
 }
@@ -186,6 +193,24 @@ func (s *HTTPListener) AddRoute(r *router.Route) error {
 	defer s.mtx.RUnlock()
 	if s.closed {
 		return ErrClosed
+	}
+	if r.Port != 0 {
+		addrs := s.Addrs
+		err := ErrUnreservedHTTP
+		found := false
+		if r.Certificate != nil {
+			addrs = s.TLSAddrs
+			err = ErrUnreservedHTTPS
+		}
+		for _, addr := range addrs {
+			port := strings.Split(addr, ":")[1]
+			if port == strconv.Itoa(int(r.Port)) {
+				found = true
+			}
+		}
+		if found != true {
+			return err
+		}
 	}
 	return s.ds.Add(r)
 }
@@ -320,21 +345,22 @@ func (h *httpSyncHandler) Set(data *router.Route) error {
 	r.rp = proxy.NewReverseProxy(bf, h.l.cookieKey, r.Sticky, service, logger)
 	r.service = service
 	h.l.routes[data.ID] = r
+	full_domain := strings.ToLower(r.Domain) + ":" + strconv.Itoa(r.Port)
 	if data.Path == "/" {
-		if tree, ok := h.l.domains[strings.ToLower(r.Domain)]; ok {
+		if tree, ok := h.l.domains[full_domain]; ok {
 			tree.backend = r
 		} else {
-			h.l.domains[strings.ToLower(r.Domain)] = NewTree(r)
+			h.l.domains[full_domain] = NewTree(r)
 		}
 	} else {
-		if tree, ok := h.l.domains[strings.ToLower(r.Domain)]; ok {
+		if tree, ok := h.l.domains[full_domain]; ok {
 			tree.Insert(r.Path, r)
 		} else {
 			logger.Error("Failed insert of path based route, consistency violation.")
 		}
 	}
 
-	go h.l.wm.Send(&router.Event{Event: router.EventTypeRouteSet, ID: r.Domain, Route: r.ToRoute()})
+	go h.l.wm.Send(&router.Event{Event: router.EventTypeRouteSet, ID: full_domain, Route: r.ToRoute()})
 	return nil
 }
 
@@ -356,9 +382,10 @@ func (h *httpSyncHandler) Remove(id string) error {
 	}
 
 	delete(h.l.routes, id)
-	if tree, ok := h.l.domains[r.Domain]; ok {
+	full_domain := strings.ToLower(r.Domain) + ":" + strconv.Itoa(r.Port)
+	if tree, ok := h.l.domains[full_domain]; ok {
 		if r.Path == "/" && tree.backend == r {
-			delete(h.l.domains, r.Domain)
+			delete(h.l.domains, full_domain)
 		} else if tree.Lookup(r.Path) == r {
 			tree.Remove(r.Path)
 		}
@@ -368,101 +395,122 @@ func (h *httpSyncHandler) Remove(id string) error {
 }
 
 func (s *HTTPListener) listenAndServe() error {
-	var err error
-	s.listener, err = listenFunc("tcp4", s.Addr)
-	if err != nil {
-		return listenErr{s.Addr, err}
-	}
-	if s.proxyProtocol {
-		s.listener = proxyproto.Listener{s.listener}
-	}
+	s.listeners = nil
+	for _, addr := range s.Addrs {
+		listener, err := listenFunc("tcp4", addr)
+		if err != nil {
+			return listenErr{addr, err}
+		}
+		if s.proxyProtocol {
+			listener = proxyproto.Listener{listener}
+		}
+		s.listeners = append(s.listeners, listener)
 
-	server := &http.Server{
-		Addr: s.listener.Addr().String(),
-		Handler: fwdProtoHandler{
-			Handler: s,
-			Proto:   "http",
-			Port:    mustPortFromAddr(s.listener.Addr().String()),
-		},
-	}
+		server := &http.Server{
+			Addr: listener.Addr().String(),
+			Handler: fwdProtoHandler{
+				Handler: s,
+				Proto:   "http",
+				Port:    mustPortFromAddr(listener.Addr().String()),
+			},
+		}
 
-	// TODO: log error
-	go server.Serve(s.listener)
+		// TODO: log error
+		go server.Serve(listener)
+	}
 	return nil
 }
 
 var errMissingTLS = errors.New("router: route not found or TLS not configured")
 
 func (s *HTTPListener) listenAndServeTLS() error {
-	certForHandshake := func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-		r := s.findRoute(hello.ServerName, "/")
-		if r == nil {
-			return nil, errMissingTLS
+	s.tlsListeners = nil
+	for _, addr := range s.TLSAddrs {
+		port, _ := strconv.Atoi(mustPortFromAddr(addr))
+		certForHandshake := func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			r := s.findRoute(hello.ServerName, port, "/")
+			if r == nil {
+				return nil, errMissingTLS
+			}
+			return r.keypair, nil
 		}
-		return r.keypair, nil
-	}
-	tlsConfig := tlsconfig.SecureCiphers(&tls.Config{
-		GetCertificate: certForHandshake,
-		Certificates:   []tls.Certificate{s.keypair},
-		NextProtos:     []string{http2.NextProtoTLS, "h2-14"},
-	})
-
-	l, err := listenFunc("tcp4", s.TLSAddr)
-	if err != nil {
-		return listenErr{s.Addr, err}
-	}
-	if s.proxyProtocol {
-		l = proxyproto.Listener{l}
-	}
-	s.tlsListener = tls.NewListener(l, tlsConfig)
-
-	handler := fwdProtoHandler{
-		Handler: s,
-		Proto:   "https",
-		Port:    mustPortFromAddr(s.tlsListener.Addr().String()),
-	}
-	http2Server := &http2.Server{}
-	http2Handler := func(hs *http.Server, c *tls.Conn, h http.Handler) {
-		http2Server.ServeConn(c, &http2.ServeConnOpts{
-			Handler:    handler,
-			BaseConfig: hs,
+		tlsConfig := tlsconfig.SecureCiphers(&tls.Config{
+			GetCertificate: certForHandshake,
+			Certificates:   []tls.Certificate{s.keypair},
+			NextProtos:     []string{http2.NextProtoTLS, "h2-14"},
 		})
+
+		l, err := listenFunc("tcp4", addr)
+		if err != nil {
+			return listenErr{addr, err}
+		}
+		if s.proxyProtocol {
+			l = proxyproto.Listener{l}
+		}
+		listener := tls.NewListener(l, tlsConfig)
+		s.tlsListeners = append(s.tlsListeners, listener)
+
+		handler := fwdProtoHandler{
+			Handler: s,
+			Proto:   "https",
+			Port:    mustPortFromAddr(listener.Addr().String()),
+		}
+
+		http2Server := &http2.Server{}
+		http2Handler := func(hs *http.Server, c *tls.Conn, h http.Handler) {
+			http2Server.ServeConn(c, &http2.ServeConnOpts{
+				Handler:    handler,
+				BaseConfig: hs,
+			})
+		}
+
+		server := &http.Server{
+			Addr:    listener.Addr().String(),
+			Handler: handler,
+			TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){
+				http2.NextProtoTLS: http2Handler,
+				"h2-14":            http2Handler,
+			},
+		}
+
+		// TODO: log error
+		go server.Serve(listener)
 	}
 
-	server := &http.Server{
-		Addr:    s.tlsListener.Addr().String(),
-		Handler: handler,
-		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){
-			http2.NextProtoTLS: http2Handler,
-			"h2-14":            http2Handler,
-		},
-	}
-
-	// TODO: log error
-	go server.Serve(s.tlsListener)
 	return nil
 }
 
-func (s *HTTPListener) findRoute(host string, path string) *httpRoute {
+func (s *HTTPListener) findRoute(host string, portInt int, path string) *httpRoute {
 	host = strings.ToLower(host)
 	if strings.Contains(host, ":") {
 		host, _, _ = net.SplitHostPort(host)
 	}
+	port := strconv.Itoa(portInt)
+	addressArrays := [][]string{s.Addrs, s.TLSAddrs}
+	for _, addressArray := range addressArrays {
+		if len(addressArray) > 0 {
+			_, defaultPort, _ := net.SplitHostPort(addressArray[0])
+			if defaultPort == port {
+				port = "0"
+			}
+		}
+	}
+	full_domain := host + ":" + port
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	if tree, ok := s.domains[host]; ok {
+	if tree, ok := s.domains[full_domain]; ok {
 		return tree.Lookup(path)
 	}
 	// handle wildcard domains up to 5 subdomains deep, from most-specific to
 	// least-specific
-	d := strings.SplitN(host, ".", 5)
+	d := strings.SplitN(full_domain, ".", 5)
 	for i := len(d); i > 0; i-- {
 		if tree, ok := s.domains["*."+strings.Join(d[len(d)-i:], ".")]; ok {
 			return tree.Lookup(path)
 		}
 	}
 	// use catch-all if available
-	if tree, ok := s.domains["*"]; ok {
+	if tree, ok := s.domains["*:"+port]; ok {
 		return tree.Lookup(path)
 	}
 	return nil
@@ -478,7 +526,11 @@ func fail(w http.ResponseWriter, code int) {
 func (s *HTTPListener) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	ctx := context.Background()
 	ctx = ctxhelper.NewContextStartTime(ctx, time.Now())
-	r := s.findRoute(req.Host, req.URL.Path)
+	host := req.Host
+	// fwdProtoHandler pushes the "real" port onto the end of X-Forwarded-Port
+	ports := strings.Split(req.Header["X-Forwarded-Port"][0], ", ")
+	port, _ := strconv.Atoi(ports[len(ports)-1])
+	r := s.findRoute(host, port, req.URL.Path)
 	if r == nil {
 		fail(w, 404)
 		return

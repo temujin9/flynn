@@ -76,6 +76,9 @@ Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
     sudo apt-get update
     sudo sh -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-9.5 postgresql-contrib-9.5 mariadb-server-10.1 percona-xtrabackup mongodb-org redis-server'
 
+    # Stop redis by default, in case the VM is being used for integration testing
+    sudo service redis-server stop
+
     # Setup postgres for controller unit tests
     sudo -u postgres createuser --superuser vagrant || true
     grep '^export PGHOST' ~/.bashrc || echo export PGHOST=/var/run/postgresql >> ~/.bashrc
